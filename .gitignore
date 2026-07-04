@@ -1,0 +1,15 @@
+# Binary
+/tradectl
+
+# Local data: SQLite DB + trade screenshots (never commit backtest data)
+/data/
+
+# Config (lives in ~/.tradectl; ignore any local copy)
+config.yaml
+
+# Claude Code local settings (personal project — keep private)
+.claude/
+
+# OS / editor cruft
+.DS_Store
+*.swp
