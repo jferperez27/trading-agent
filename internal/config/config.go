@@ -11,33 +11,17 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config mirrors ~/.tradectl/config.yaml (see Documentation/00-MASTER.md).
+// Config mirrors ~/.tradectl/config.yaml. Unknown keys in an existing file are
+// ignored, so older configs keep working.
 type Config struct {
-	// Name of the environment variable that holds the Anthropic API key.
-	// The key itself is never stored in config or on disk.
-	AnthropicAPIKeyEnv string `yaml:"anthropic_api_key_env"`
-	// Default model for per-trade analysis (lightweight check).
-	DefaultModelTrade string `yaml:"default_model_trade"`
-	// Default model for per-session critique.
-	DefaultModelSession string `yaml:"default_model_session"`
-	// Number of prior session summaries to feed into a new session analysis.
-	// Consumed in Sprint 2; carried here so config is stable across sprints.
-	LongitudinalContextCount int `yaml:"longitudinal_context_count"`
-	// Monthly spend threshold (used in Sprint 3).
-	MonthlyCostAlertThresholdUSD float64 `yaml:"monthly_cost_alert_threshold_usd"`
 	// Root directory for the SQLite DB and screenshots.
 	DataDir string `yaml:"data_dir"`
 }
 
-// Defaults returns a Config populated with the documented default values.
+// Defaults returns a Config populated with the default values.
 func Defaults() Config {
 	return Config{
-		AnthropicAPIKeyEnv:           "ANTHROPIC_API_KEY",
-		DefaultModelTrade:            "claude-haiku-4-5-20251001",
-		DefaultModelSession:          "claude-sonnet-4-6",
-		LongitudinalContextCount:     3,
-		MonthlyCostAlertThresholdUSD: 10.00,
-		DataDir:                      "./data",
+		DataDir: "./data",
 	}
 }
 
@@ -79,21 +63,6 @@ func Load() (cfg Config, createdPath string, err error) {
 	return cfg, "", nil
 }
 
-// APIKey resolves the Anthropic API key from the configured environment
-// variable. It returns a clear error if the variable is unset or empty so that
-// analyze fails fast rather than hanging or panicking.
-func (c Config) APIKey() (string, error) {
-	envName := c.AnthropicAPIKeyEnv
-	if envName == "" {
-		envName = "ANTHROPIC_API_KEY"
-	}
-	key := os.Getenv(envName)
-	if key == "" {
-		return "", fmt.Errorf("API key not found: environment variable %s is unset or empty", envName)
-	}
-	return key, nil
-}
-
 func write(path string, cfg Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating config dir: %w", err)
@@ -102,9 +71,7 @@ func write(path string, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("marshaling config: %w", err)
 	}
-	header := "# tradectl configuration\n" +
-		"# The API key itself is read from the environment variable named below;\n" +
-		"# it is never stored here.\n"
+	header := "# tradectl configuration\n"
 	if err := os.WriteFile(path, append([]byte(header), out...), 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}

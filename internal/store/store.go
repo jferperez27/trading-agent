@@ -3,8 +3,11 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"embed"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -125,69 +128,140 @@ func (s *Store) migrate() error {
 
 // --- Sessions ---
 
-// CreateSession inserts a new open session and returns its ID.
-func (s *Store) CreateSession(instrument, notes string) (int64, error) {
+// newUID returns a random 16-byte hex string used as a session's unique id.
+func newUID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generating uid: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// CreateSession inserts a new open session and returns its ID. The session's
+// UID is generated here.
+func (s *Store) CreateSession(p SessionParams) (int64, error) {
+	uid, err := newUID()
+	if err != nil {
+		return 0, err
+	}
 	now := time.Now().UTC().Format(timeLayout)
-	res, err := s.db.Exec(
-		`INSERT INTO sessions (started_at, ended_at, instrument, notes) VALUES (?, NULL, ?, ?)`,
-		now, instrument, notes)
+	res, err := s.db.Exec(`
+		INSERT INTO sessions
+		    (uid, name, market, started_at, ended_at, instrument, initial_balance, notes)
+		VALUES (?, ?, ?, ?, NULL, ?, ?, ?)`,
+		uid, p.Name, p.Market, now, p.Instrument, p.InitialBalance, p.Notes)
 	if err != nil {
 		return 0, fmt.Errorf("inserting session: %w", err)
 	}
 	return res.LastInsertId()
 }
 
-// CloseSession sets ended_at on an open session. It returns an error if the
-// session does not exist or is already closed.
+// CloseSession sets ended_at on an open session and generates + stores the
+// close-time metadata JSON (duration, aggregate stats, final balance). It
+// returns an error if the session does not exist or is already closed.
 func (s *Store) CloseSession(id int64) error {
-	var endedAt sql.NullString
-	err := s.db.QueryRow(`SELECT ended_at FROM sessions WHERE id = ?`, id).Scan(&endedAt)
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("session %d does not exist", id)
-	}
+	sess, err := s.GetSession(id)
 	if err != nil {
-		return fmt.Errorf("looking up session %d: %w", id, err)
+		return err
 	}
-	if endedAt.Valid {
+	if sess.EndedAt != nil {
 		return fmt.Errorf("session %d is already closed", id)
 	}
-	now := time.Now().UTC().Format(timeLayout)
-	if _, err := s.db.Exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, now, id); err != nil {
+
+	stats, err := s.SessionStats(id)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	meta := ClosedMeta{
+		ClosedAt:        now.Format(timeLayout),
+		DurationSeconds: int64(now.Sub(sess.StartedAt).Seconds()),
+		TradeCount:      stats.TradeCount,
+		Wins:            stats.Wins,
+		Losses:          stats.Losses,
+		TotalPnLPoints:  stats.TotalPnLPoints,
+		TotalPnLCash:    stats.TotalPnLCash,
+		WinRate:         stats.WinRate,
+		AvgRMultiple:    stats.AvgRMultiple,
+		FinalBalance:    stats.CurrentBalance,
+	}
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshaling closed_meta for session %d: %w", id, err)
+	}
+
+	if _, err := s.db.Exec(`UPDATE sessions SET ended_at = ?, closed_meta = ? WHERE id = ?`,
+		now.Format(timeLayout), string(metaJSON), id); err != nil {
 		return fmt.Errorf("closing session %d: %w", id, err)
 	}
 	return nil
 }
 
-// GetSession loads a single session by ID.
-func (s *Store) GetSession(id int64) (Session, error) {
-	var (
-		sess      Session
-		startedAt string
-		endedAt   sql.NullString
-	)
-	err := s.db.QueryRow(
-		`SELECT id, started_at, ended_at, instrument, notes FROM sessions WHERE id = ?`, id).
-		Scan(&sess.ID, &startedAt, &endedAt, &sess.Instrument, &sess.Notes)
-	if err == sql.ErrNoRows {
-		return Session{}, fmt.Errorf("session %d does not exist", id)
-	}
+// SessionStats computes the live aggregates for a session from its trades.
+func (s *Store) SessionStats(id int64) (Stats, error) {
+	sess, err := s.GetSession(id)
 	if err != nil {
-		return Session{}, fmt.Errorf("loading session %d: %w", id, err)
+		return Stats{}, err
+	}
+	trades, err := s.GetSessionTrades(id)
+	if err != nil {
+		return Stats{}, err
+	}
+	return ComputeStats(sess.InitialBalance, trades), nil
+}
+
+const sessionColumns = `id, uid, name, market, started_at, ended_at, instrument,
+	initial_balance, notes, closed_meta`
+
+// scanSession scans one session row (in sessionColumns order) from any
+// row-scanner (sql.Row or sql.Rows).
+func scanSession(scan func(...any) error) (Session, error) {
+	var (
+		sess       Session
+		startedAt  string
+		endedAt    sql.NullString
+		closedMeta sql.NullString
+	)
+	err := scan(&sess.ID, &sess.UID, &sess.Name, &sess.Market, &startedAt, &endedAt,
+		&sess.Instrument, &sess.InitialBalance, &sess.Notes, &closedMeta)
+	if err != nil {
+		return Session{}, err
 	}
 	sess.StartedAt = parseTime(startedAt)
 	if endedAt.Valid {
 		t := parseTime(endedAt.String)
 		sess.EndedAt = &t
 	}
+	if closedMeta.Valid {
+		sess.ClosedMeta = closedMeta.String
+	}
 	return sess, nil
 }
 
-// ListSessions returns all sessions (newest first) with their trade counts.
+// GetSession loads a single session by ID.
+func (s *Store) GetSession(id int64) (Session, error) {
+	row := s.db.QueryRow(`SELECT `+sessionColumns+` FROM sessions WHERE id = ?`, id)
+	sess, err := scanSession(row.Scan)
+	if err == sql.ErrNoRows {
+		return Session{}, fmt.Errorf("session %d does not exist", id)
+	}
+	if err != nil {
+		return Session{}, fmt.Errorf("loading session %d: %w", id, err)
+	}
+	return sess, nil
+}
+
+// ListSessions returns all sessions (newest first) with trade aggregates.
 func (s *Store) ListSessions() ([]SessionListRow, error) {
 	rows, err := s.db.Query(`
-		SELECT s.id, s.started_at, s.ended_at, s.instrument, s.notes,
-		       (SELECT COUNT(1) FROM trades t WHERE t.session_id = s.id) AS trade_count
+		SELECT s.id, s.uid, s.name, s.market, s.started_at, s.ended_at, s.instrument,
+		       s.initial_balance, s.notes, s.closed_meta,
+		       COUNT(t.id) AS trade_count,
+		       COALESCE(SUM(t.pnl_cash), 0) AS total_pnl_cash
 		FROM sessions s
+		LEFT JOIN trades t ON t.session_id = s.id
+		GROUP BY s.id
 		ORDER BY s.id DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("listing sessions: %w", err)
@@ -197,17 +271,23 @@ func (s *Store) ListSessions() ([]SessionListRow, error) {
 	var out []SessionListRow
 	for rows.Next() {
 		var (
-			r         SessionListRow
-			startedAt string
-			endedAt   sql.NullString
+			r          SessionListRow
+			startedAt  string
+			endedAt    sql.NullString
+			closedMeta sql.NullString
 		)
-		if err := rows.Scan(&r.ID, &startedAt, &endedAt, &r.Instrument, &r.Notes, &r.TradeCount); err != nil {
+		if err := rows.Scan(&r.ID, &r.UID, &r.Name, &r.Market, &startedAt, &endedAt,
+			&r.Instrument, &r.InitialBalance, &r.Notes, &closedMeta,
+			&r.TradeCount, &r.TotalPnLCash); err != nil {
 			return nil, fmt.Errorf("scanning session: %w", err)
 		}
 		r.StartedAt = parseTime(startedAt)
 		if endedAt.Valid {
 			t := parseTime(endedAt.String)
 			r.EndedAt = &t
+		}
+		if closedMeta.Valid {
+			r.ClosedMeta = closedMeta.String
 		}
 		out = append(out, r)
 	}
@@ -231,19 +311,24 @@ func (s *Store) LatestOpenSessionID() (int64, bool, error) {
 
 // --- Trades ---
 
-// InsertTrade computes pnl/r_multiple, inserts the trade, and returns its ID.
+// InsertTrade computes pnl, r_multiple, and pnl_cash, inserts the trade, and
+// returns its ID. A zero/negative Size defaults to 1 (pnl_cash == pnl points).
 // The screenshot path is stored separately via SetTradeScreenshot once the
 // trade ID is known (the filename embeds the trade ID).
 func (s *Store) InsertTrade(t Trade) (int64, error) {
+	if t.Size <= 0 {
+		t.Size = 1
+	}
 	pnl, r := ComputeMetrics(t.Direction, t.EntryPrice, t.ExitPrice, t.StopLoss)
+	pnlCash := pnl * t.Size
 	now := time.Now().UTC().Format(timeLayout)
 	res, err := s.db.Exec(`
 		INSERT INTO trades
-		    (session_id, entry_price, exit_price, stop_loss, direction, setup_type,
-		     pnl, r_multiple, screenshot_path, leak_tags, notes, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-		t.SessionID, t.EntryPrice, t.ExitPrice, t.StopLoss, t.Direction, t.SetupType,
-		pnl, r, encodeLeakTags(t.LeakTags), t.Notes, now)
+		    (session_id, entry_price, exit_price, stop_loss, size, direction, setup_type,
+		     pnl, pnl_cash, r_multiple, screenshot_path, leak_tags, notes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+		t.SessionID, t.EntryPrice, t.ExitPrice, t.StopLoss, t.Size, t.Direction, t.SetupType,
+		pnl, pnlCash, r, encodeLeakTags(t.LeakTags), t.Notes, now)
 	if err != nil {
 		return 0, fmt.Errorf("inserting trade: %w", err)
 	}
@@ -276,11 +361,11 @@ func (s *Store) GetTrade(id int64) (Trade, error) {
 		createdAt  string
 	)
 	err := s.db.QueryRow(`
-		SELECT id, session_id, entry_price, exit_price, stop_loss, direction, setup_type,
-		       pnl, r_multiple, screenshot_path, leak_tags, notes, created_at
+		SELECT id, session_id, entry_price, exit_price, stop_loss, size, direction, setup_type,
+		       pnl, pnl_cash, r_multiple, screenshot_path, leak_tags, notes, created_at
 		FROM trades WHERE id = ?`, id).
-		Scan(&t.ID, &t.SessionID, &t.EntryPrice, &t.ExitPrice, &t.StopLoss, &t.Direction,
-			&t.SetupType, &t.PnL, &t.RMultiple, &screenshot, &leakTags, &t.Notes, &createdAt)
+		Scan(&t.ID, &t.SessionID, &t.EntryPrice, &t.ExitPrice, &t.StopLoss, &t.Size, &t.Direction,
+			&t.SetupType, &t.PnL, &t.PnLCash, &t.RMultiple, &screenshot, &leakTags, &t.Notes, &createdAt)
 	if err == sql.ErrNoRows {
 		return Trade{}, fmt.Errorf("trade %d does not exist", id)
 	}
@@ -298,8 +383,8 @@ func (s *Store) GetTrade(id int64) (Trade, error) {
 // GetSessionTrades loads all trades for a session, oldest first.
 func (s *Store) GetSessionTrades(sessionID int64) ([]Trade, error) {
 	rows, err := s.db.Query(`
-		SELECT id, session_id, entry_price, exit_price, stop_loss, direction, setup_type,
-		       pnl, r_multiple, screenshot_path, leak_tags, notes, created_at
+		SELECT id, session_id, entry_price, exit_price, stop_loss, size, direction, setup_type,
+		       pnl, pnl_cash, r_multiple, screenshot_path, leak_tags, notes, created_at
 		FROM trades WHERE session_id = ? ORDER BY id ASC`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("loading trades for session %d: %w", sessionID, err)
@@ -315,8 +400,8 @@ func (s *Store) GetSessionTrades(sessionID int64) ([]Trade, error) {
 			createdAt  string
 		)
 		if err := rows.Scan(&t.ID, &t.SessionID, &t.EntryPrice, &t.ExitPrice, &t.StopLoss,
-			&t.Direction, &t.SetupType, &t.PnL, &t.RMultiple, &screenshot, &leakTags,
-			&t.Notes, &createdAt); err != nil {
+			&t.Size, &t.Direction, &t.SetupType, &t.PnL, &t.PnLCash, &t.RMultiple,
+			&screenshot, &leakTags, &t.Notes, &createdAt); err != nil {
 			return nil, fmt.Errorf("scanning trade: %w", err)
 		}
 		if screenshot.Valid {
@@ -327,29 +412,6 @@ func (s *Store) GetSessionTrades(sessionID int64) ([]Trade, error) {
 		out = append(out, t)
 	}
 	return out, rows.Err()
-}
-
-// --- Analyses ---
-
-// InsertAnalysis records a Claude analysis call and returns its ID. An empty
-// Summary is stored as SQL NULL.
-func (s *Store) InsertAnalysis(a Analysis) (int64, error) {
-	now := time.Now().UTC().Format(timeLayout)
-	var summary any
-	if a.Summary != "" {
-		summary = a.Summary
-	}
-	res, err := s.db.Exec(`
-		INSERT INTO analyses
-		    (scope, target_id, model_used, input_tokens, output_tokens, cost_usd,
-		     result_text, summary, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.Scope, a.TargetID, a.ModelUsed, a.InputTokens, a.OutputTokens, a.CostUSD,
-		a.ResultText, summary, now)
-	if err != nil {
-		return 0, fmt.Errorf("inserting analysis: %w", err)
-	}
-	return res.LastInsertId()
 }
 
 func parseTime(s string) time.Time {

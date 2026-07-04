@@ -51,6 +51,7 @@ func newLogCmd() *cobra.Command {
 				EntryPrice: res.Entry,
 				ExitPrice:  res.Exit,
 				StopLoss:   res.Stop,
+				Size:       res.Size,
 				Direction:  res.Direction,
 				SetupType:  res.Setup,
 				LeakTags:   res.Leaks,

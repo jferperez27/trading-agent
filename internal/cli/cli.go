@@ -10,6 +10,7 @@ import (
 
 	"tradectl/internal/config"
 	"tradectl/internal/store"
+	"tradectl/internal/tui"
 )
 
 // app bundles the loaded config and an open store for a single command run.
@@ -35,15 +36,26 @@ func loadApp() (*app, error) {
 	return &app{cfg: cfg, st: st}, nil
 }
 
-// newRootCmd builds the root command with all subcommands attached.
+// newRootCmd builds the root command with all subcommands attached. Invoked
+// with no subcommand, tradectl launches the full-screen interactive app; the
+// subcommands remain for shell scripting.
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "tradectl",
-		Short:         "Personal FxReplay backtest session analyzer & documentor",
+		Short:         "Personal FxReplay backtest session logger & tracker",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			a, err := loadApp()
+			if err != nil {
+				return err
+			}
+			defer a.st.Close()
+			return tui.Run(a.st, a.cfg)
+		},
 	}
-	root.AddCommand(newSessionsCmd(), newLogCmd(), newAnalyzeCmd())
+	root.AddCommand(newSessionsCmd(), newLogCmd())
 	return root
 }
 

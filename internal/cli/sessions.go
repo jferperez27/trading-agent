@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+
+	"tradectl/internal/store"
 )
 
 func newSessionsCmd() *cobra.Command {
@@ -34,6 +37,20 @@ func newSessionsNewCmd() *cobra.Command {
 			defer a.st.Close()
 
 			r := bufio.NewReader(os.Stdin)
+			name, err := promptLine(r, "Session name: ")
+			if err != nil {
+				return err
+			}
+			if name == "" {
+				return fmt.Errorf("session name is required")
+			}
+			market, err := promptLine(r, fmt.Sprintf("Market (%s): ", strings.Join(store.Markets, "/")))
+			if err != nil {
+				return err
+			}
+			if !slices.Contains(store.Markets, market) {
+				return fmt.Errorf("invalid market %q (want one of: %s)", market, strings.Join(store.Markets, ", "))
+			}
 			instrument, err := promptLine(r, "Instrument (e.g. NQ, ES): ")
 			if err != nil {
 				return err
@@ -41,16 +58,30 @@ func newSessionsNewCmd() *cobra.Command {
 			if instrument == "" {
 				return fmt.Errorf("instrument is required")
 			}
+			balanceStr, err := promptLine(r, "Initial money (e.g. 50000): ")
+			if err != nil {
+				return err
+			}
+			balance, err := strconv.ParseFloat(balanceStr, 64)
+			if err != nil {
+				return fmt.Errorf("invalid initial money %q", balanceStr)
+			}
 			notes, err := promptLine(r, "Notes (optional): ")
 			if err != nil {
 				return err
 			}
 
-			id, err := a.st.CreateSession(instrument, notes)
+			id, err := a.st.CreateSession(store.SessionParams{
+				Name:           name,
+				Market:         market,
+				Instrument:     instrument,
+				InitialBalance: balance,
+				Notes:          notes,
+			})
 			if err != nil {
 				return err
 			}
-			fmt.Printf("Created session %d (%s).\n", id, instrument)
+			fmt.Printf("Created session %d (%s, %s %s).\n", id, name, market, instrument)
 			return nil
 		},
 	}
@@ -103,14 +134,15 @@ func newSessionsListCmd() *cobra.Command {
 			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tINSTRUMENT\tSTARTED\tENDED\tTRADES")
+			fmt.Fprintln(w, "ID\tNAME\tMARKET\tINSTRUMENT\tSTARTED\tENDED\tTRADES\tP/L")
 			for _, r := range rows {
 				ended := "(open)"
 				if r.EndedAt != nil {
 					ended = r.EndedAt.Local().Format("2006-01-02 15:04")
 				}
-				fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%d\n",
-					r.ID, r.Instrument, r.StartedAt.Local().Format("2006-01-02 15:04"), ended, r.TradeCount)
+				fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%d\t%+.2f\n",
+					r.ID, r.Name, r.Market, r.Instrument,
+					r.StartedAt.Local().Format("2006-01-02 15:04"), ended, r.TradeCount, r.TotalPnLCash)
 			}
 			return w.Flush()
 		},
