@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -14,15 +15,30 @@ import (
 // Config mirrors ~/.tradectl/config.yaml. Unknown keys in an existing file are
 // ignored, so older configs keep working.
 type Config struct {
-	// Root directory for the SQLite DB and screenshots.
+	// Root directory for the SQLite DB and screenshots. A leading "~/" is
+	// expanded to the user's home directory. The default is a fixed location
+	// under the home dir so tradectl behaves the same no matter which
+	// directory it is launched from (it is installed as a global command).
 	DataDir string `yaml:"data_dir"`
 }
 
 // Defaults returns a Config populated with the default values.
 func Defaults() Config {
 	return Config{
-		DataDir: "./data",
+		DataDir: "~/.tradectl/data",
 	}
+}
+
+// expandHome resolves a leading "~" or "~/" in path to the home directory.
+func expandHome(path string) (string, error) {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving home directory: %w", err)
+	}
+	return filepath.Join(home, strings.TrimPrefix(path, "~")), nil
 }
 
 // Path returns the absolute path to the config file (~/.tradectl/config.yaml).
@@ -47,8 +63,12 @@ func Load() (cfg Config, createdPath string, err error) {
 
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
+		// Persist the portable "~/" form; return the expanded path for use.
 		if werr := write(path, cfg); werr != nil {
 			return cfg, "", werr
+		}
+		if cfg.DataDir, err = expandHome(cfg.DataDir); err != nil {
+			return cfg, "", err
 		}
 		return cfg, path, nil
 	}
@@ -59,6 +79,9 @@ func Load() (cfg Config, createdPath string, err error) {
 	// Unmarshal over the defaults so unspecified keys keep their default value.
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, "", fmt.Errorf("parsing %s: %w", path, err)
+	}
+	if cfg.DataDir, err = expandHome(cfg.DataDir); err != nil {
+		return cfg, "", err
 	}
 	return cfg, "", nil
 }

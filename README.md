@@ -11,20 +11,35 @@ Backtest-only by design: no live market data, no auth, no multi-user concerns.
 
 - Go 1.26+
 
-## Install
+## Install (Global Installation - Recommended)
 
+```bash
+go install ./cmd/tradectl
+```
+
+This drops a self-contained binary (pure-Go SQLite, no CGO) into `$HOME/go/bin`.
+Make sure that's on your `PATH` — add this to `~/.zshrc` (or your shell's rc) if
+it isn't:
+
+```bash
+export PATH="$PATH:$HOME/go/bin"
+```
+
+Then `tradectl` works from any directory.
+
+## Install (Local Installation)
 ```bash
 go build -o tradectl ./cmd/tradectl
 ```
 
-The binary is self-contained (pure-Go SQLite, no CGO).
+Can be invoked using `./tradectl`
 
 ## Usage
 
 ### The app
 
 ```bash
-tradectl        # launches the full-screen interactive app
+tradectl        # from any directory — launches the full-screen interactive app
 ```
 
 You land on the **sessions menu** and stay in the app until you quit:
@@ -63,17 +78,20 @@ tradectl log                          # standalone trade-logging form
 On first run, `tradectl` creates `~/.tradectl/config.yaml`:
 
 ```yaml
-data_dir: ./data    # SQLite DB + screenshots live here
+data_dir: ~/.tradectl/data    # SQLite DB + screenshots live here (~ is expanded)
 ```
+
+The data dir is a fixed location under your home directory so the app sees the
+same data no matter where you launch it from.
 
 ## Data
 
-Everything is stored under `data_dir` (default `./data`):
+Everything is stored under `data_dir` (default `~/.tradectl/data`):
 
 - `tradectl.db` — SQLite database (`sessions`, `trades`)
 - `screenshots/` — copied trade screenshots, referenced by relative path in the DB
 
-Inspect directly any time with `sqlite3 data/tradectl.db`.
+Inspect directly any time with `sqlite3 ~/.tradectl/data/tradectl.db`.
 
 ## Project layout
 
