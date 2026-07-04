@@ -87,8 +87,7 @@ internal/
 tests/                 # test suite (black-box, exercises exported APIs)
 ```
 
-Each `internal/` package owns a single concern; `cli` is orchestration only. See
-`CLAUDE.md` for the architecture and data-flow detail.
+Each `internal/` package owns a single concern; `cli` is orchestration only.
 
 ## Development
 
